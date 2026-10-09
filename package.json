@@ -1,0 +1,21 @@
+{
+  "name": "erp-incremental-sync",
+  "version": "1.0.0",
+  "description": "Incremental, idempotent ERP to database sync with dry-run, cursoring and safe re-runs, demonstrated against a mock Odoo-style JSON-RPC server.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "mock-erp": "node mock-erp/server.mjs",
+    "mock-erp:mutate": "node --env-file-if-exists=.env scripts/mutate.mjs",
+    "sync": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env scripts/sync.mjs",
+    "report": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env scripts/report.mjs",
+    "dupes:plan": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env scripts/dupes-plan.mjs",
+    "dupes:apply": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env scripts/dupes-apply.mjs",
+    "dupes:rollback": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env scripts/dupes-rollback.mjs",
+    "test": "node --disable-warning=ExperimentalWarning --test \"test/**/*.test.js\""
+  }
+}
