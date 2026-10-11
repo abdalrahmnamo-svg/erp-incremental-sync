@@ -2,7 +2,9 @@
 // yields the same records, so tests and the README demo are reproducible.
 
 const STAGES = [[1, 'New'], [2, 'In Progress'], [3, 'Waiting'], [4, 'Solved']]
-const AGENTS = [[101, 'Agent Alpha'], [102, 'Agent Beta'], [103, 'Agent Gamma']]
+const AGENTS = [[1, 'Agent Alpha'], [2, 'Agent Beta'], [3, 'Agent Gamma']]
+const CHANNELS = ['chat', 'email', 'phone']
+const CATEGORIES = ['billing', 'technical_issue', 'delivery', 'general_inquiry', 'account_access', 'returns_refunds']
 const SUBJECTS = [
   'Cannot log in', 'Invoice question', 'Export is slow',
   'Update billing address', 'Feature request: dark mode', 'Password reset loop',
@@ -16,7 +18,9 @@ export const MESSAGE_MODEL = 'mail.message'
 export function fmt(date) {
   return date.toISOString().slice(0, 19).replace('T', ' ')
 }
-const at = (iso, plusMinutes) => fmt(new Date(Date.parse(iso) + plusMinutes * 60_000))
+// Accepts both ISO ('...T...Z') and Odoo-style ('YYYY-MM-DD HH:MM:SS', UTC) strings; the latter must
+// not be parsed as local time or the data would shift with the machine's timezone.
+const at = (iso, plusMinutes) => fmt(new Date(Date.parse(/[TZ]/.test(iso) ? iso : `${iso.replace(' ', 'T')}Z`) + plusMinutes * 60_000))
 
 function customer(c) {
   return {
@@ -36,8 +40,8 @@ export function seedStore({ ticketCount = 60 } = {}) {
   const tickets = []
   const messages = []
   let msgId = 0
-  const addMsg = (ticketId, k, date, writeDate, ticketCustomer, body, system = false) => {
-    const agentSide = k % 2 === 1
+  const addMsg = (ticketId, k, date, writeDate, ticketCustomer, body, system = false, agentReplies = true) => {
+    const agentSide = agentReplies && k % 2 === 1
     messages.push({
       id: ++msgId,
       model: TICKET_MODEL,
@@ -59,6 +63,7 @@ export function seedStore({ ticketCount = 60 } = {}) {
     const createDate = at('2026-01-01T00:00:00Z', i * 180)
     const writeDate = at('2026-02-01T00:00:00Z', Math.floor((i - 1) / 6) * 60)
     const stage = STAGES[i % 4]
+    const answered = i % 9 !== 0 // every 9th ticket has no first response yet
     tickets.push({
       id: i,
       name: `${SUBJECTS[i % 6]} (#${pad(i, 4)})`,
@@ -67,12 +72,19 @@ export function seedStore({ ticketCount = 60 } = {}) {
       priority: String(i % 3),
       user_id: i % 4 === 0 ? false : AGENTS[i % 3],
       description: `<p>Synthetic description for ticket ${i}.</p>`,
+      // x_* are custom fields (the Odoo naming convention) feeding the warehouse landing contract.
+      x_customer_ref: `CUST-${pad(c, 4)}`,
+      x_external_ref: `EXT-${pad(i * 7919, 8)}`,
+      x_channel: CHANNELS[i % 3],
+      x_category: CATEGORIES[i % 6],
+      x_first_response_at: answered ? at(createDate, 20) : false, // = the first agent message (k=1)
+      x_resolved_at: stage[0] === 4 ? at(createDate, 300 + i) : false,
       create_date: createDate,
       write_date: writeDate,
     })
     const n = 2 + (i % 3)
     for (let k = 0; k < n; k++) {
-      addMsg(i, k, at(createDate, (k + 1) * 10), writeDate, cust, `<p>Message ${k + 1} for ticket ${i}.</p>`)
+      addMsg(i, k, at(createDate, (k + 1) * 10), writeDate, cust, `<p>Message ${k + 1} for ticket ${i}.</p>`, false, answered)
     }
     if (stage[0] === 4) addMsg(i, 9, at(createDate, 200), writeDate, cust, '<p>Ticket closed.</p>', true)
   }
@@ -96,6 +108,12 @@ export function seedStore({ ticketCount = 60 } = {}) {
       })
     }
   })
+
+  // A duplicate that carries no agent message is not "answered" (keeps first_response_at consistent with its thread).
+  for (const t of tickets.slice(regular)) {
+    const hasAgent = messages.some((m) => m.res_id === t.id && Array.isArray(m.author_id) && /^Agent/.test(m.author_id[1]))
+    if (!hasAgent) t.x_first_response_at = false
+  }
 
   // Noise on another model: the sync must filter these out by model.
   for (let i = 1; i <= 3; i++) {

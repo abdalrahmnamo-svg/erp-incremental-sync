@@ -10,3 +10,5 @@ coverage/
 _import/
 .vscode/*
 .idea/
+*.duckdb
+*.duckdb.wal

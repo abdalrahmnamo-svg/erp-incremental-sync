@@ -15,3 +15,7 @@ export function parseArgs(argv) {
 
 export const dbPath = (env = process.env) => resolve(env.SYNC_DB_PATH || join('output', 'sync.db'))
 export const outputDir = () => resolve('output')
+
+/** DuckDB warehouse file: --warehouse, else WAREHOUSE_PATH, else ./output/warehouse.duckdb. */
+export const warehousePath = (args = {}, env = process.env) =>
+  resolve(args.warehouse && args.warehouse !== true ? String(args.warehouse) : env.WAREHOUSE_PATH || join('output', 'warehouse.duckdb'))

@@ -21,7 +21,7 @@ export const DEFAULT_OVERLAP_SECONDS = 2
 
 export const ORDER = 'write_date asc, id asc'
 
-const after = (a, b) => a.write_date > b.write_date || (a.write_date === b.write_date && a.id > b.id)
+export const after = (a, b) => a.write_date > b.write_date || (a.write_date === b.write_date && a.id > b.id)
 
 /** Rows strictly after (write_date, id): the id breaks ties between identical write_dates. */
 export function keysetDomain(pos) {

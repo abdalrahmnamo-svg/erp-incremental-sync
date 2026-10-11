@@ -1,10 +1,75 @@
 # erp-incremental-sync
 
-Incremental, idempotent ERP-to-database sync with dry-run mode, cursoring and safe re-runs, demonstrated against a mock Odoo-style JSON-RPC server.
+Incremental ERP ingestion with a write_date cursor, an overlap window and dry-run: lands changed rows into SQLite, or append-only into the `raw` schema of a DuckDB + dbt warehouse with a queryable run log. Demonstrated against a mock Odoo-style JSON-RPC server with synthetic data.
+
+## Where it fits
+
+This is the ingestion layer for [support-analytics-warehouse](https://github.com/abdalrahmnamo-svg/support-analytics-warehouse), a DuckDB + dbt warehouse. That repo defines a raw landing contract (`raw.tickets`, `raw.messages`, each with `_loaded_at` and `_batch_id`); this repo can deliver rows in exactly that shape.
+
+```mermaid
+flowchart LR
+  E[(ERP<br/>Odoo-style JSON-RPC)] -->|search_read since cursor<br/>minus overlap| S[erp-incremental-sync<br/>this repo]
+  S -->|append + _loaded_at + _batch_id| R[(DuckDB raw schema<br/>tickets, messages)]
+  S -.->|one row per model per run| L[raw._sync_runs<br/>raw._sync_cursor]
+  R --> D[dbt warehouse<br/>staging: latest write_date per id<br/>then marts]
+```
+
+```bash
+npm run mock-erp                                   # terminal 1: mock ERP on http://localhost:8069
+npm run sync -- --target duckdb --warehouse ../support-analytics-warehouse/warehouse/support.duckdb --id-offset 900000
+cd ../support-analytics-warehouse/dbt && dbt build # terminal 2: rebuild the warehouse on the landed rows
+```
+
+`--id-offset` puts the mock ERP's ids (1..60) in their own range so they do not collide with ids the warehouse generator already created. `--dry-run` works for this target too and writes nothing (no rows, no cursor, no run-log entry, no file). `npm run land:demo -- --warehouse <file.duckdb>` does a first load, edits three ERP records, loads again and prints the run log, with no server to start.
+
+**Checked end to end** on a throwaway copy of the warehouse (the real repo was not touched): after the generator and `dbt build` gave `PASS=158 WARN=7 ERROR=0`, landing the mock ERP's 250 rows plus a second batch of 24 changed rows and running `dbt build` again gave `PASS=159 WARN=6 ERROR=0`. All 61 landed tickets reached `marts.fct_tickets`, and the edited ticket shows two raw versions with the latest one winning in staging.
+
+### Raw is append-only, on purpose
+
+Each run appends the rows it fetched; nothing is updated or deleted in `raw`. That is the usual landing pattern: raw keeps every delivered version, so you can audit what the source said and when, replay a bad transform, and recover from a bug downstream. Deduplication is a modelling decision and lives in the warehouse: its staging models keep the latest `write_date` per id (ties broken by `_loaded_at`). The overlap window means a normal run re-appends a few unchanged rows; they are identical versions, so they do not change the "latest per id" result (a test asserts this). The trade-off is storage growth proportional to the overlap, which is small, and a `raw` table that is not unique on its id.
+
+### Run log: pipeline observability in SQL
+
+Every non-dry run writes one row per model to `raw._sync_runs` (inserted as `running` at the start and updated when the model finishes, so a killed process leaves a visible `running` row; a failed model records `failed` and the error text). The cursor lives next to it in `raw._sync_cursor` and advances in the same transaction as each page.
+
+```sql
+SELECT batch_id, model, started_at, finished_at, fetched, appended, cursor_before, cursor_after, status, error
+FROM raw._sync_runs
+ORDER BY started_at DESC, model;
+
+-- how much of each run was real change vs overlap re-read, and how long it took
+SELECT batch_id, model, appended,
+       date_diff('millisecond', started_at, finished_at) AS ms,
+       status
+FROM raw._sync_runs
+WHERE started_at > now() - INTERVAL 7 DAY;
+```
+
+Output of the first query after `land:demo` (columns trimmed):
+
+```
+batch_id                     model             fetched  appended  cursor_after              status
+erp_20261011T114545Z_l8pg    helpdesk.ticket   60       60        2026-02-01 09:00:00#60    success
+erp_20261011T114545Z_l8pg    mail.message      190      190       2026-02-01 09:00:00#190   success
+erp_20261011T114545Z_76pz    helpdesk.ticket   8        8         2026-10-11 11:45:45#61    success
+erp_20261011T114545Z_76pz    mail.message      16       16        2026-10-11 11:45:45#194   success
+```
+
+Landed columns and types are exactly the warehouse contract: `raw.tickets` (`ticket_id BIGINT, external_ref, customer_id, channel, category, priority, stage VARCHAR, created_at, first_response_at, resolved_at TIMESTAMP, assigned_agent_id BIGINT, write_date TIMESTAMP, _loaded_at TIMESTAMP, _batch_id VARCHAR`) and `raw.messages` (`message_id BIGINT, ticket_id BIGINT, author_type VARCHAR, sent_at TIMESTAMP, body_chars BIGINT, write_date TIMESTAMP, _loaded_at, _batch_id`). The test suite asserts the names and types against a list copied from the contract, and the loader refuses to append into an existing `raw` table whose shape differs.
+
+## CDC patterns: when to use which
+
+| Pattern | How it finds changes | Strengths | Weaknesses | Use when |
+|---|---|---|---|---|
+| **Cursor + overlap** (this repo) | `write_date >= last cursor - overlap`, keyset-paged on `(write_date, id)` | Needs only a read API and a reliable modified timestamp; cheap; resumable; easy to reason about | Misses hard deletes; misses commits that land later than the overlap; trusts the source's `write_date` | SaaS/ERP APIs (Odoo, Salesforce style), no database access, moderate volume |
+| **Log-based CDC** (Debezium, database WAL/binlog) | Reads the database transaction log | Sees every insert, update and delete in commit order; no load on source tables; low latency | Needs database-level access and a connector plus a broker to run; schema changes and replay need care | You own or can replicate the source database and need deletes, ordering or near-real-time |
+| **Full snapshot** | Re-extracts the whole table each run | Simplest; self-healing; deletes show up as absences; no timestamp needed | Cost grows with table size; hammers the source; noisy diffs unless you compare snapshots | Small reference tables, sources with no usable change marker, or as a periodic reconciliation next to a cursor |
+
+In practice these combine: a cursor sync for the daily flow, an occasional `--since` re-read or full snapshot to catch late commits and deletes. This repo covers the first and shows how a run is audited; it does not implement the other two.
 
 ## Problem
 
-Pulling "everything" from an ERP on every run is slow, hammers the API, and makes re-runs risky. Pulling "what changed" is only safe if three things hold: a re-run never double-writes, a crash never skips rows, and you can preview what a run would do first. This repo shows one way to get all three with nothing but Node and SQLite.
+Pulling "everything" from an ERP on every run is slow, hammers the API, and makes re-runs risky. Pulling "what changed" is only safe if three things hold: a re-run never double-writes, a crash never skips rows, and you can preview what a run would do first. This repo shows one way to get all three with Node and a local database (SQLite by default, DuckDB for the warehouse target).
 
 ## How it works
 
@@ -19,7 +84,7 @@ flowchart LR
 
 ## Tech
 
-Node 24, built-in `node:sqlite`, built-in `fetch` and `node:test`. No runtime dependencies, no Docker. The ERP is a small mock (`mock-erp/server.mjs`) speaking the `/jsonrpc` shape (`common.authenticate`, `object.execute_kw` with `search_read`) over seeded synthetic `helpdesk.ticket` and `mail.message` data.
+Node 24, built-in `node:sqlite`, `fetch` and `node:test`. The only runtime dependency is the official DuckDB client `@duckdb/node-api` (pinned), used by the `--target duckdb` path and loaded only when that target is selected. No Docker. The ERP is a small mock (`mock-erp/server.mjs`) speaking the `/jsonrpc` shape (`common.authenticate`, `object.execute_kw` with `search_read`) over seeded synthetic `helpdesk.ticket` and `mail.message` data. Tickets carry custom `x_*` fields (channel, category, customer and external reference, first response and resolution time) so the data can be mapped onto the warehouse contract; the SQLite path ignores them.
 
 ## Quick start
 
@@ -102,6 +167,8 @@ npm run dupes:rollback -- output/dupes-plan-<id>.json          # restore the exa
 - Relations are not enforced: messages are synced after tickets and are keyed by ticket id without a foreign key.
 - The mock supports only `search_read`, `search_count`, `read` and the domain operators used here (`=`, `!=`, `>`, `>=`, `<`, `<=`, `in`, `not in`, `&`, `|`, `!`).
 - Single writer: run one sync at a time against a target database.
+- DuckDB target: the duplicate cleanup (`dupes:*`) is SQLite-only; raw keeps ERP-side duplicates as delivered and leaves them to the warehouse. Hard deletes are not landed. ERP stage names are mapped to the warehouse vocabulary (`New`/`In Progress` to `open`, `Waiting` to `pending`, `Solved` to `solved`) and numeric priorities to `low`/`normal`/`high`/`urgent`; nothing else is cleaned in raw.
+- The mock data is synthetic and the warehouse flags most landed rows as late-arriving (their `write_date` is far older than the load time); that is a property of the demo, not of the loader.
 
 ## Background
 
